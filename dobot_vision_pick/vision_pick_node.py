@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 
 import rclpy
+import cv2
+import numpy as np
+
+from functools import partial
 from rclpy.node import Node
 
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 
+
+from dobot_msgs_v3.srv import MovL
+
 # If you want robot info later:
 # from dobot_msgs_v3.msg import ToolVectorActual
 # from dobot_msgs_v3.srv import JointMovJ
 
-import cv2
-import numpy as np
 
 
 def calculateTransform(
@@ -66,6 +71,8 @@ def calculateTransform(
     }
 
 
+
+
 class VisionPickNode(Node):
     def __init__(self):
         super().__init__('vision_pick_node')
@@ -92,7 +99,16 @@ class VisionPickNode(Node):
         
         image_topic = self.get_parameter('image_topic').get_parameter_value().string_value
         
-        
+        # MovL client
+        self.movl_client = self.create_client(MovL, '/dobot_bringup_v3/srv/MovL')
+        if not self.movl_client.wait_for_service(timeout_sec=5.0):
+            self.get_logger().warn("MovL service not available after 5s")
+            
+
+
+        # store last computed approach/pick pose (from homography)
+        self.last_approach = None   # (X_a, Y_a, Z_a)
+        self.last_pick = None       # (X_p, Y_p, Z_p)
         """
         =======================================================================================
             Self Parameter Set
@@ -138,8 +154,30 @@ class VisionPickNode(Node):
         tr = pts[np.argmin(d)]
         bl = pts[np.argmax(d)]
         return np.array([tl, tr, br, bl], dtype=np.float32) 
+        
+    # ================== Your Dobot Service ==================
+            
 
-    # ====== Your homography code should go here ======
+    def moveL(self, x, y, z, rx=-180.0, ry=0.0, rz=-90.0):
+        """Basic MovL: send and return immediately (no wait)"""
+        req = MovL.Request()
+        req.x = float(x)
+        req.y = float(y)
+        req.z = float(z)
+        req.rx = float(rx)
+        req.ry = float(ry)
+        req.rz = float(rz)
+        req.param_value = []
+
+        try:
+            self.movl_client.call_async(req)  # fire and forget
+            self.get_logger().info(f"→ MovL({x:.1f}, {y:.1f}, {z:.1f})")
+        except Exception as e:
+            self.get_logger().error(f"❌ MovL failed: {e}")
+    
+        
+    # ================== Your homography code should go here ==================
+    
     def homography_find_xy_mm(self, frame) -> (bool, float, float):
     
         
@@ -326,9 +364,13 @@ class VisionPickNode(Node):
             table_center_base=(bx, by, bz),
             clearance=clearance
         )
-
+        
         X_a, Y_a, Z_a = approach
         X_p, Y_p, Z_p = pick
+        
+        self.last_approach = approach
+        self.last_pick = pick
+        
     
         Cmd_str = "ros2 service call /dobot_bringup_v3/srv/MovL dobot_msgs_v3/srv/MovL"
         Approach_str = f'{Cmd_str} "{{x: {X_a:.2f}, y: {Y_a:.2f}, z: {Z_a:.2f}, rx: -180.0, ry: 0.0, rz: -90.0, param_value: []}}"'
@@ -337,27 +379,43 @@ class VisionPickNode(Node):
         # 4) Print info so you can check against reality
         self.get_logger().info(
             f"🧡 Homo XY = ({x_mm:.2f}, {y_mm:.2f}) mm\n"
-            f"{Approach_str}\n"
-            f"{Pick_str}\n",throttle_duration_sec=5.0
+            ,throttle_duration_sec=5.0
         )
 
         # Optional: draw result on image
-        cv2.circle(frame, (int(msg.width/2), int(msg.height/2)), 5, (0, 0, 255), -1)
-        cv2.putText(frame, f"Xh={x_mm:.2f} Yh={y_mm:.2f}",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                    (0, 255, 0), 2)
+        #cv2.circle(frame, (int(msg.width/2), int(msg.height/2)), 5, (0, 0, 255), -1)
+        #cv2.putText(frame, f"Xh={x_mm:.2f} Yh={y_mm:.2f}",
+                 #   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                 #   (0, 255, 0), 2)
         # cv2.imshow("camera", frame)
         # cv2.waitKey(1)
 
-        # 5) LATER: here you will call Dobot service to move.
-        #    For now, we ONLY compute and print positions.
-        #    Example skeleton (DON'T enable until IK is ready):
-        #
-        # if self.joint_client is not None:
-        #     req = JointMovJ.Request()
-        #     req.j1 = ...
-        #     ...
-        #     self.joint_client.call_async(req)
+        # Start ROS2 HERE ---------------------------------------------------------------------
+
+        
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == 32:  # SPACE
+            space_pressed = True
+            if self.last_approach and self.last_pick:
+                X_a, Y_a, Z_a = self.last_approach
+                X_p, Y_p, Z_p = self.last_pick
+
+                # 1) Approach: Do not wait
+                self.moveL(X_a, Y_a, Z_a)
+
+                # 2) Pick: Wait
+                self.moveL(X_p, Y_p, Z_p)
+
+                # 3) Lift: Wait
+                self.moveL(X_p, Y_p, Z_a)
+                
+                # 4) Start Pos
+                self.moveL(520.0, -37.5, 580)
+
+            else:
+                self.get_logger().warn("No target available!")
+
 
 def main(args=None):
     rclpy.init(args=args)
