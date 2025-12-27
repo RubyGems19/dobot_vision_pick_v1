@@ -25,6 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'vision_pick_node = dobot_vision_pick.vision_pick_node:main',
+            'test = dobot_vision_pick.test:main',
         ],
     },
 )

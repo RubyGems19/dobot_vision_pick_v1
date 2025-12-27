@@ -11,7 +11,8 @@ from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 
 
-from dobot_msgs_v3.srv import MovL
+from dobot_msgs_v3.srv import *
+
 
 # If you want robot info later:
 # from dobot_msgs_v3.msg import ToolVectorActual
@@ -96,19 +97,31 @@ class VisionPickNode(Node):
 
         self.declare_parameter('lower_black', [0, 0, 0])
         self.declare_parameter('upper_black', [180, 255, 70])
+
+     
         
         image_topic = self.get_parameter('image_topic').get_parameter_value().string_value
-        
-        # MovL client
-        self.movl_client = self.create_client(MovL, '/dobot_bringup_v3/srv/MovL')
-        if not self.movl_client.wait_for_service(timeout_sec=5.0):
-            self.get_logger().warn("MovL service not available after 5s")
-            
+
+        # ---- Create service clients ----
+        self.movl_client   = self.create_client(MovL,   "/dobot_bringup_v3/srv/MovL")
+        self.movlio_client = self.create_client(MovLIO, "/dobot_bringup_v3/srv/MovLIO")
+        self.do_client     = self.create_client(DO,     "/dobot_bringup_v3/srv/DO")
+        self.sync_client   = self.create_client(Sync,   "/dobot_bringup_v3/srv/Sync")
+
+        # Wait a bit for services
+        self._wait_for_service(self.movl_client,   "MovL")
+        self._wait_for_service(self.movlio_client, "MovLIO")
+        self._wait_for_service(self.do_client,     "DO")
+        self._wait_for_service(self.sync_client,   "Sync")
+        print("\n")
 
 
         # store last computed approach/pick pose (from homography)
         self.last_approach = None   # (X_a, Y_a, Z_a)
         self.last_pick = None       # (X_p, Y_p, Z_p)
+        self.is_busy = False
+        self.target = None
+        self.step = 0
         """
         =======================================================================================
             Self Parameter Set
@@ -119,9 +132,15 @@ class VisionPickNode(Node):
         self.declare_parameter('showimg', 0)
         
         # Read parameter values
-        self.showimg   = self.get_parameter('showimg').value
+        self.showimg   = self.get_parameter('showimg').value 
         
-        
+        """
+        =======================================================================================
+            Init pos
+        =======================================================================================
+        """
+
+        self.init_pos_robot()
         
         # subscribe image
         self.create_subscription(
@@ -132,6 +151,26 @@ class VisionPickNode(Node):
         )
         
         self.get_logger().info(f"VisionPickNode subscribed to {image_topic}")
+        
+        """
+        =======================================================================================
+            Init pos End
+        =======================================================================================
+        """        
+    def init_pos_robot(self):
+        self.call_do(1,0)
+        self.call_do(2,0)
+        self.call_do(3,1)
+        self.moveL(520.0, -37.0, 580)     
+        self.call_sync()
+        self.call_do(3,0)
+        self.get_logger().info(f"Go Home Position")
+              
+    def _wait_for_service(self, client, name):
+        if not client.wait_for_service(timeout_sec=5.0):
+            self.get_logger().warn(f"Service {name} not available after 5s")
+        else:
+            self.get_logger().info(f"Service {name} is ready")    
 
     def centroid(self,cnt):
         """Return contour centroid (cx,cy) in pixels."""
@@ -157,7 +196,9 @@ class VisionPickNode(Node):
         
     # ================== Your Dobot Service ==================
             
-
+    # ------------------------------------------------------------
+    # 1) MovL: linear move 
+    # ------------------------------------------------------------
     def moveL(self, x, y, z, rx=-180.0, ry=0.0, rz=-90.0):
         """Basic MovL: send and return immediately (no wait)"""
         req = MovL.Request()
@@ -174,6 +215,99 @@ class VisionPickNode(Node):
             self.get_logger().info(f"→ MovL({x:.1f}, {y:.1f}, {z:.1f})")
         except Exception as e:
             self.get_logger().error(f"❌ MovL failed: {e}")
+            
+    # ------------------------------------------------------------
+    # 2) MovLIO: linear move + extra options via param_value[]
+    # ------------------------------------------------------------
+    def call_MovLIO(self, x, y, z, rx=-180.0, ry=0.0, rz=-90.0, param_list=None):
+        """Call MovLIO once and wait for result."""
+        if param_list is None:
+            param_list = []
+
+        req = MovLIO.Request()
+        req.x = float(x)
+        req.y = float(y)
+        req.z = float(z)
+        req.rx = float(rx)
+        req.ry = float(ry)
+        req.rz = float(rz)
+        # IMPORTANT: param_value is string[]
+        req.param_value = [str(s) for s in param_list]
+
+        self.get_logger().info(
+            f"Calling MovLIO: ({req.x:.1f},{req.y:.1f},{req.z:.1f}) "
+            f"rx={req.rx}, ry={req.ry}, rz={req.rz}, param_value={req.param_value}\n"
+        )
+
+        future = self.movlio_client.call_async(req)
+        rclpy.spin_until_future_complete(self, future)
+
+        if future.result() is not None:
+            self.get_logger().info(f"MovLIO response res={future.result().res}")
+        else:
+            self.get_logger().error("MovLIO call failed")
+            
+    # ------------------------------------------------------------
+    # 2) DO: digital output ON/OFF
+    #    ⚠️ You MUST adjust field names to match your `ros2 interface show dobot_msgs_v3/srv/DO`
+    # ------------------------------------------------------------
+    def call_do(self, index: int, status: int):
+        """
+        Example DO service: set digital output.
+        Many Dobot DO services look like:
+            int32 index
+            int32 status
+            ---
+            int32 res
+        But PLEASE confirm with `ros2 interface show dobot_msgs_v3/srv/DO`.
+        """
+        req = DO.Request()
+
+        # 🔴 ADJUST THESE FIELD NAMES IF NEEDED
+        # Use exactly the names you see from ros2 interface show.
+        # For example, it might be:
+        #   req.index = index
+        #   req.status = status
+        # or   req.id = index ; req.value = status
+        req.index = int(index)
+        req.status = int(status)
+
+        self.get_logger().info(f"Calling DO: index={req.index}, status={req.status}")
+
+        future = self.do_client.call_async(req)
+        rclpy.spin_until_future_complete(self, future)
+
+        if future.result() is not None:
+            self.get_logger().info(f"DO response res={future.result().res}")
+        else:
+            self.get_logger().error("DO call failed")
+
+    # ------------------------------------------------------------
+    # 3) Sync: block until robot finishes (depends on your driver)
+    # ------------------------------------------------------------
+    def call_sync(self):
+        """
+        Example Sync service call.
+        You MUST check `ros2 interface show dobot_msgs_v3/srv/Sync` to see
+        if it has any request fields. Often it's empty or has string[] param_value.
+        """
+        req = Sync.Request()
+
+        # If Sync has fields, set them here, example:
+        #   req.param_value = []
+        #   or req.id = 0
+        # Adjust to match your interface!
+
+        self.get_logger().info("Calling Sync (wait robot)")
+
+        future = self.sync_client.call_async(req)
+        rclpy.spin_until_future_complete(self, future)
+
+        if future.result() is not None:
+            self.get_logger().info(f"DO response res={future.result().res}")
+        else:
+            self.get_logger().error("DO call failed")             
+            
     
         
     # ================== Your homography code should go here ==================
@@ -346,6 +480,7 @@ class VisionPickNode(Node):
             # cv2.imshow("Not Found", frame)
             # cv2.waitKey(1)
             return
+            
 
         # 2) Get parameters
         table_size = float(self.get_parameter('table_size').value)
@@ -354,67 +489,79 @@ class VisionPickNode(Node):
         bz = float(self.get_parameter('table_center_z').value)
         obj_h = float(self.get_parameter('object_height').value)
         clearance = float(self.get_parameter('clearance').value)
-
-        # 3) Convert to robot base coordinates
-        approach, pick, debug = calculateTransform(
-            xh=x_mm,
-            yh=y_mm,
-            obj_h=obj_h,
-            table_size=table_size,
-            table_center_base=(bx, by, bz),
-            clearance=clearance
-        )
         
+        
+   
+                    # 3) Convert to robot base coordinates
+        approach, pick, debug = calculateTransform(
+                xh=x_mm,
+                yh=y_mm,
+                obj_h=obj_h,
+                table_size=table_size,
+                table_center_base=(bx, by, bz),
+                clearance=clearance
+        )
+            
         X_a, Y_a, Z_a = approach
         X_p, Y_p, Z_p = pick
-        
+            
         self.last_approach = approach
         self.last_pick = pick
-        
     
-        Cmd_str = "ros2 service call /dobot_bringup_v3/srv/MovL dobot_msgs_v3/srv/MovL"
-        Approach_str = f'{Cmd_str} "{{x: {X_a:.2f}, y: {Y_a:.2f}, z: {Z_a:.2f}, rx: -180.0, ry: 0.0, rz: -90.0, param_value: []}}"'
-        Pick_str = f'{Cmd_str} "{{x: {X_p:.2f}, y: {Y_p:.2f}, z: {Z_p:.2f}, rx: -180.0, ry: 0.0, rz: -90.0, param_value: []}}"'
-     
-        # 4) Print info so you can check against reality
-        self.get_logger().info(
-            f"🧡 Homo XY = ({x_mm:.2f}, {y_mm:.2f}) mm\n"
-            ,throttle_duration_sec=5.0
-        )
-
-        # Optional: draw result on image
-        #cv2.circle(frame, (int(msg.width/2), int(msg.height/2)), 5, (0, 0, 255), -1)
-        #cv2.putText(frame, f"Xh={x_mm:.2f} Yh={y_mm:.2f}",
-                 #   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                 #   (0, 255, 0), 2)
-        # cv2.imshow("camera", frame)
-        # cv2.waitKey(1)
-
-        # Start ROS2 HERE ---------------------------------------------------------------------
-
-        
         key = cv2.waitKey(1) & 0xFF
 
-        if key == 32:  # SPACE
-            space_pressed = True
-            if self.last_approach and self.last_pick:
-                X_a, Y_a, Z_a = self.last_approach
-                X_p, Y_p, Z_p = self.last_pick
+        if key == 32 and not self.is_busy:
+            self.is_busy = True
+            self.target = (X_a, Y_a, Z_a, X_p, Y_p, Z_p)
+            self.get_logger().info("🔶 Task triggered — executing pick sequence")
+            self.pick_sequence()   # Start sequence outside callback
+            
+            
+    def pick_sequence(self):
+        if not self.target:
+            self.get_logger().warn("❌ No target set")
+            self.is_busy = False
+            return
 
-                # 1) Approach: Do not wait
-                self.moveL(X_a, Y_a, Z_a)
+        X_a, Y_a, Z_a, X_p, Y_p, Z_p = self.target
 
-                # 2) Pick: Wait
-                self.moveL(X_p, Y_p, Z_p)
+        # 1) Approach
+        self.moveL(X_a, Y_a, Z_a)
+        
 
-                # 3) Lift: Wait
-                self.moveL(X_p, Y_p, Z_a)
-                
-                # 4) Start Pos
-                self.moveL(520.0, -37.5, 580)
+        # 2) Down
+        self.moveL(X_p, Y_p, Z_p)
+        
 
-            else:
-                self.get_logger().warn("No target available!")
+        # 3) Grab
+        self.call_sync()
+        self.call_do(2, 1)
+        
+
+        # 4) Lift
+        self.moveL(X_a, Y_a, Z_a)
+        
+
+        # 5) Move to drop
+        self.moveL(600, 300, 150)
+        
+        self.moveL(600, 300, 10)
+        
+
+        # 6) Release
+        self.call_do(2, 0)
+        
+
+        # 7) Back up and home
+        self.moveL(600, 300, 150)
+        
+        self.moveL(520, -37.5, 580)
+        
+
+        self.get_logger().info("🎉 Task complete")
+        
+        self.is_busy = False
+
 
 
 def main(args=None):
